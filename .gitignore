@@ -15,3 +15,6 @@ modem_log.txt
 
 # Claude Code local settings
 .claude/
+
+# PyInstaller build artifacts
+*.spec

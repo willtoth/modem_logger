@@ -1,0 +1,48 @@
+name: Build & Publish
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build Windows EXE
+        shell: pwsh
+        run: >
+          uvx --with pyserial pyinstaller
+          --onefile --windowed
+          --name modem-logger
+          --collect-all serial
+          main.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modem-logger-windows
+          path: dist/modem-logger.exe
+          if-no-files-found: error
+
+      - name: Publish rolling "latest" release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest \
+            dist/modem-logger.exe \
+            --title "Latest build" \
+            --notes "Automated build from commit ${{ github.sha }} on $(date -u +'%Y-%m-%d %H:%M UTC')."
