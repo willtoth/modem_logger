@@ -14,11 +14,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so commit count is accurate
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+
+      - name: Bake version into _version.py
+        shell: bash
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          SHA=$(git rev-parse --short HEAD)
+          echo "__version__ = \"r${COUNT}+${SHA}\"" > _version.py
+          cat _version.py
 
       - name: Build Windows EXE
         shell: pwsh
@@ -27,6 +37,7 @@ jobs:
           --onefile --windowed
           --name modem-logger
           --collect-all serial
+          --hidden-import _version
           main.py
 
       - name: Upload build artifact

@@ -18,3 +18,6 @@ modem_log.txt
 
 # PyInstaller build artifacts
 *.spec
+
+# Auto-generated version stamp (CI writes it before PyInstaller)
+_version.py

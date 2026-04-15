@@ -5,7 +5,36 @@ from serial.tools import list_ports
 import threading
 import time
 import datetime
+import os
 import re
+import subprocess
+
+
+def _detect_version():
+    # Prefer a baked-in version (CI writes _version.py before PyInstaller
+    # bundles the .exe). Fall back to live git for local dev. Last resort
+    # is "dev".
+    try:
+        from _version import __version__ as baked
+        return baked
+    except ImportError:
+        pass
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        count = subprocess.check_output(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=here, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=here, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return f"r{count}+{sha}"
+    except Exception:
+        return "dev"
+
+
+__version__ = _detect_version()
 
 BAUDRATE = 115200
 # Quectel modules expose ~7 USB interfaces (Diag, AP Log, MOS, NMEA, AT, CP Log,
@@ -437,7 +466,7 @@ COLUMN_TOOLTIPS = {
 class ModemUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("EG915U Logger")
+        self.root.title(f"EG915U Logger {__version__}")
         self.root.geometry("900x760")
         self.is_polling = False
         self.com_port = None
