@@ -1,21 +1,28 @@
 # modem-logger
 
-A small tkinter GUI for logging, monitoring, and site-scanning with a **Quectel EG915U** LTE Cat 1 bis modem over a USB serial AT port.
+A small tkinter GUI for logging, monitoring, and per-PLMN cell scanning with a **Quectel EG915U** LTE Cat 1 bis modem over a USB serial AT port.
 
 ## Features
 
 - **Auto device discovery** — enumerates Quectel USB serial ports on startup with a Rescan button.
 - **Live signal monitoring** — polls `AT+CSQ` every 5 s, renders as dBm, bars, and BER.
-- **Site scan** — runs `AT+CEREG?` / `AT+QNWINFO` / `AT+QCSQ` / `AT+QENG="servingcell"` / `AT+QCELLINFO?` / `AT+QENG="neighbourcell"` in sequence (~3–8 s) and displays the serving cell plus every neighbor cell the modem has measured, with MCC/MNC, PCI, EARFCN, cell ID, TAC, RSRP, RSRQ, and SINR.
-- **PLMN scan** — on-demand `AT+COPS=?` (slow, 1–3 min) to enumerate every visible carrier.
+- **Full Network Scan** — single button (slow, 3–8 min) that enumerates every visible PLMN via `AT+COPS=?` and then captures rich per-cell data. Behaviour depends on SIM state:
+  - **SIM present**: force-registers to each non-Forbidden PLMN in turn (`AT+COPS=1,2,…`), waits for `CEREG` to confirm registration, then records `CSQ` / `QCSQ` / `QENG="servingcell"`. Restores `AT+COPS=0` automatically in a `finally:` block. Successful PLMNs show full cell detail; rejected ones are flagged.
+  - **No SIM**: skips registration (impossible without credentials) but uses limited-service (LIMSRV) camping plus `AT+QCELLINFO?` to capture serving + intra-frequency neighbour cells. The matching PLMN row is enriched with rich data; other rows show discovery info only.
+- **Per-PLMN result table** with columns: Operator, MCC/MNC, RAT, PCI, EARFCN, Cell ID, TAC, RSRP, RSRQ, RSSI, SINR. Hover any column header for an explanation of the acronym and typical signal-quality ranges.
 - **Console** — every raw AT command and response is timestamped, written to the UI log, and appended to `modem_log.txt`.
+- **Versioned builds** — the window title shows `r<commit-count>+<short-sha>` so you can tell builds apart at a glance.
 
 ## Hardware
 
 - Quectel EG915U (or any module that shares its AT command set — EC200U family).
 - USB cable to a Windows host.
 
-## Windows setup
+## Quick start (pre-built .exe)
+
+If you just want to run the tool, grab `modem-logger.exe` from the [latest release](../../releases/latest). It's a single-file PyInstaller bundle — no Python or `uv` install needed. You still need the [Quectel USB driver](#3-install-the-quectel-usb-driver) (see below) for the modem to enumerate as a COM port.
+
+## Windows setup (from source)
 
 ### 1. Install Python 3.11+
 
@@ -61,9 +68,13 @@ The app opens, auto-detects Quectel ports, and selects the first one. If nothing
 
 ## Notes
 
-- **Cold-start site scans are empty.** The EG915U can only report cells its RRC layer has measured. Until the modem has attached to the network (Signal polling shows a usable RSSI, or CEREG shows `home`/`roaming`), a site scan typically returns just the serving row. Give it ~10 seconds after power-on.
+- **A Full Network Scan takes a while.** `AT+COPS=?` alone can take up to 3 minutes; with a SIM present, each per-PLMN registration adds another 20–35 s. Plan for 3–8 minutes total. The status label updates per PLMN so you can watch progress.
+- **Without a SIM the modem still camps in LIMSRV mode** on the strongest cell it can find. That's where the rich data comes from in no-SIM scans — `QENG="servingcell"` reports state `LIMSRV` plus full cell detail, and `QCELLINFO?` adds intra-frequency neighbour cells (marked `(nbr)` in the Operator column). Cross-PLMN data without a SIM is fundamentally limited to whichever cell the modem decides to camp on.
+- **Forbidden PLMNs are skipped.** Rows where `COPS=?` reports `stat=3` are dropped before the registration loop — they would always reject with `+CME ERROR: 30` and waste time.
+- **GSM rows give less detail than LTE.** `QCSQ` and `QENG="servingcell"` are LTE-focused; GSM-only PLMNs show CSQ-derived dBm in the RSRP column and dashes elsewhere.
 - **Only one thing can hold the serial port at a time.** Close any other tool (QNavigator, PuTTY, etc.) before starting the app.
-- **Signal polling and scans are mutually exclusive.** Stop polling before launching a site or PLMN scan.
+- **Signal polling and scans are mutually exclusive.** Stop polling before launching a Full Network Scan.
+- **Data connectivity drops during a scan.** Manual registration to each PLMN tears down whatever data session was active. The trailing `AT+COPS=0` restores automatic mode at the end.
 - **EG915U is LTE + GSM only** (Cat 1 bis). No UMTS/HSPA. Expect `AcT = 0 (GSM)` or `7 (LTE)` in results.
 
 ## Adding a dependency
