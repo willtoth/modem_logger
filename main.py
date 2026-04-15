@@ -170,6 +170,30 @@ def parse_cops(response):
     return ops
 
 
+def parse_cme_error(response):
+    m = re.search(r'\+CME ERROR:\s*(\d+)', response or '')
+    return int(m.group(1)) if m else None
+
+
+def dedupe_plmns(ops):
+    # Drop Forbidden (stat=3) and entries missing numeric/act. Collapse
+    # duplicate (numeric, act) pairs. Order so the original Current entry
+    # (stat=2) sorts last — that way the final AT+COPS=0 re-registers to
+    # the same operator the modem started on, minimizing churn.
+    seen = set()
+    out = []
+    for op in ops:
+        if op.get("stat") == 3 or not op.get("numeric") or op.get("act") is None:
+            continue
+        key = (op["numeric"], op["act"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(op)
+    out.sort(key=lambda o: (o.get("stat") == 2, o["numeric"], o["act"]))
+    return out
+
+
 def _int_or_none(v):
     if v is None or v == '' or v == '-':
         return None
@@ -304,35 +328,9 @@ def parse_qeng_servingcell(response):
     return None
 
 
-def parse_qeng_neighbourcell(response):
-    out = []
-    for line in (response or '').splitlines():
-        m = re.match(r'\+QENG:\s*"neighbourcell(?:\s+(\w+))?","(\w+)",(.*)', line)
-        if not m:
-            continue
-        subtype = m.group(1) or ""
-        rat = m.group(2)
-        fields = _split_csv_quoted(m.group(3))
-
-        def _val(i):
-            return fields[i] if i < len(fields) else None
-
-        if rat == "LTE":
-            out.append({
-                "subtype": subtype,
-                "rat": "LTE",
-                "earfcn": _int_or_none(_val(0)),
-                "pci": _int_or_none(_val(1)),
-                "rsrp": _int_or_none(_val(2)),
-                "rsrq": _int_or_none(_val(3)),
-                "rssi": _int_or_none(_val(4)),
-                "sinr": qeng_sinr_to_db(_int_or_none(_val(5))),
-                "srxlev": _int_or_none(_val(6)),
-            })
-    return out
-
-
 def parse_qcellinfo(response):
+    # QuecCell response: one line per cell (serving + decoded intra-freq
+    # neighbours). Works in LIMSRV mode — no SIM required.
     cells = []
     for line in (response or '').splitlines():
         m = re.match(r'\+QCELLINFO:\s*"(servingcell|neighbourcell)","LTE",(.*)', line)
@@ -360,6 +358,80 @@ def parse_qcellinfo(response):
             "sinr": qeng_sinr_to_db(_int_or_none(_val(10))),
         })
     return cells
+
+
+class TreeHeaderTooltip:
+    # Hover-tooltip for ttk.Treeview column headings. tkinter has no built-in
+    # tooltip, so we manage a tiny Toplevel manually based on cursor region.
+    def __init__(self, tree, descriptions):
+        self._tree = tree
+        self._descriptions = descriptions
+        self._tip = None
+        self._current = None
+        tree.bind("<Motion>", self._on_motion)
+        tree.bind("<Leave>", self._hide)
+
+    def _on_motion(self, event):
+        if self._tree.identify_region(event.x, event.y) != "heading":
+            self._hide()
+            return
+        col_id = self._tree.identify_column(event.x)  # "#1", "#2", ...
+        try:
+            idx = int(col_id.lstrip("#")) - 1
+            col_name = self._tree["columns"][idx]
+        except (ValueError, IndexError):
+            self._hide()
+            return
+        if col_name == self._current:
+            return
+        self._hide()
+        desc = self._descriptions.get(col_name)
+        if not desc:
+            return
+        self._current = col_name
+        self._tip = tk.Toplevel(self._tree)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 18}")
+        tk.Label(
+            self._tip, text=desc,
+            background="#ffffe0", relief="solid", borderwidth=1,
+            wraplength=360, justify="left", padx=6, pady=4,
+            font=("TkDefaultFont", 9),
+        ).pack()
+
+    def _hide(self, _event=None):
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+        self._current = None
+
+
+COLUMN_TOOLTIPS = {
+    "operator": "Network operator name (e.g. \"AT&T\", \"MTN\").",
+    "mccmnc": "MCC / MNC — Mobile Country Code / Mobile Network Code. "
+              "Together they form the PLMN that uniquely identifies a "
+              "carrier worldwide (e.g. 310/410 = AT&T US).",
+    "rat": "Radio Access Technology — LTE, GSM, etc.",
+    "pci": "Physical Cell ID (0–503). Distinguishes cells/sectors on the "
+           "same tower at the same frequency.",
+    "earfcn": "E-UTRA Absolute Radio Frequency Channel Number — the "
+              "specific LTE downlink channel the cell is broadcasting on.",
+    "cell_id": "Globally unique LTE cell identifier (hex). Encodes the "
+               "eNodeB ID + sector index.",
+    "tac": "Tracking Area Code — geographic grouping the cell belongs to. "
+           "Used by the network for paging and mobility.",
+    "rsrp": "Reference Signal Received Power (dBm). Per-resource-element "
+            "LTE signal strength. Higher = better. Excellent ≥ −80, good "
+            "−80 to −90, fair −90 to −100, poor ≤ −110.",
+    "rsrq": "Reference Signal Received Quality (dB). Ratio of RSRP to RSSI "
+            "— a quality metric. Higher = better. Excellent ≥ −10, fair "
+            "−10 to −15, poor ≤ −20.",
+    "rssi": "Received Signal Strength Indicator (dBm). Total in-band power "
+            "including signal, noise, and interference. Less diagnostic "
+            "than RSRP for LTE.",
+    "sinr": "Signal-to-Interference-plus-Noise Ratio (dB). Higher = better. "
+            "Excellent ≥ 20, good 13–20, fair 0–13, poor < 0.",
+}
 
 
 class ModemUI:
@@ -404,42 +476,43 @@ class ModemUI:
 
         sig.columnconfigure(3, weight=1)
 
-        # --- Site Scan frame ---
-        site = ttk.LabelFrame(root, text="Site Scan")
+        # --- Network Scan frame ---
+        site = ttk.LabelFrame(root, text="Network Scan")
         site.pack(pady=4, padx=10, fill="x")
 
         self.lbl_context = ttk.Label(
             site,
-            text="Click Site Scan to enumerate cells.",
+            text="Click Full Network Scan to enumerate PLMNs.",
             foreground="#444",
             wraplength=860,
             justify="left",
         )
         self.lbl_context.grid(row=0, column=0, columnspan=3, padx=8, pady=(8, 4), sticky="w")
 
-        columns = ("type", "mccmnc", "pci", "earfcn", "cell_id", "tac", "rsrp", "rsrq", "sinr")
+        columns = ("operator", "mccmnc", "rat", "pci", "earfcn", "cell_id", "tac", "rsrp", "rsrq", "rssi", "sinr")
         self.cells_tree = ttk.Treeview(site, columns=columns, show="headings", height=7)
         for col, text, width, anchor in [
-            ("type",    "Type",    80,  "w"),
-            ("mccmnc",  "MCC/MNC", 80,  "w"),
-            ("pci",     "PCI",     60,  "e"),
-            ("earfcn",  "EARFCN",  80,  "e"),
-            ("cell_id", "Cell ID", 100, "w"),
-            ("tac",     "TAC",     70,  "w"),
-            ("rsrp",    "RSRP",    70,  "e"),
-            ("rsrq",    "RSRQ",    70,  "e"),
-            ("sinr",    "SINR",    70,  "e"),
+            ("operator", "Operator", 110, "w"),
+            ("mccmnc",   "MCC/MNC",  80,  "w"),
+            ("rat",      "RAT",      60,  "w"),
+            ("pci",      "PCI",      60,  "e"),
+            ("earfcn",   "EARFCN",   80,  "e"),
+            ("cell_id",  "Cell ID",  100, "w"),
+            ("tac",      "TAC",      70,  "w"),
+            ("rsrp",     "RSRP",     70,  "e"),
+            ("rsrq",     "RSRQ",     70,  "e"),
+            ("rssi",     "RSSI",     70,  "e"),
+            ("sinr",     "SINR",     70,  "e"),
         ]:
             self.cells_tree.heading(col, text=text)
             self.cells_tree.column(col, width=width, anchor=anchor)
         self.cells_tree.tag_configure("serving", background="#d4edda")
+        self.cells_tree.tag_configure("failed", background="#f8d7da")
         self.cells_tree.grid(row=1, column=0, columnspan=3, padx=8, pady=(4, 4), sticky="nsew")
+        TreeHeaderTooltip(self.cells_tree, COLUMN_TOOLTIPS)
 
-        self.btn_site_scan = tk.Button(site, text="Site Scan", command=self.site_scan, width=18)
-        self.btn_site_scan.grid(row=2, column=0, padx=(8, 4), pady=(4, 8), sticky="w")
-
-        self.btn_plmn_scan = tk.Button(site, text="PLMN Scan (slow, 1-3 min)", command=self.plmn_scan, width=26)
-        self.btn_plmn_scan.grid(row=2, column=1, padx=4, pady=(4, 8), sticky="w")
+        self.btn_full_scan = tk.Button(site, text="Full Network Scan (slow, 3–8 min)", command=self.full_scan, width=32)
+        self.btn_full_scan.grid(row=2, column=0, columnspan=2, padx=(8, 4), pady=(4, 8), sticky="w")
 
         self.lbl_scan_status = ttk.Label(site, text="", foreground="#666")
         self.lbl_scan_status.grid(row=2, column=2, padx=8, pady=(4, 8), sticky="w")
@@ -504,36 +577,26 @@ class ModemUI:
         self.lbl_ber.config(text=f"BER: {csq['ber_text']}")
         self.lbl_raw_csq.config(text=f"rssi={csq['rssi']}")
 
-    def _apply_site_scan(self, ctx, cells):
-        # Context strip
+    def _apply_full_scan(self, ctx, results):
+        # Context strip — reflects state BEFORE the scan began (where the modem
+        # was camped originally, since per-PLMN detail now lives per-row).
         parts = []
         cereg = ctx.get("cereg")
         if cereg:
-            parts.append(f"State: {cereg['stat_label']}")
+            parts.append(f"Start: {cereg['stat_label']}")
             if cereg.get("tac"):
                 parts.append(f"TAC {cereg['tac']}")
         qnw = ctx.get("qnwinfo")
         if qnw and qnw.get("act") and qnw["act"] != "No Service":
-            mccmnc = qnw.get("oper") or "?"
-            parts.append(f"{qnw['act']} · {mccmnc}")
+            oper = qnw.get("oper") or "?"
+            parts.append(f"{qnw['act']} · {oper}")
             if qnw.get("band"):
                 parts.append(qnw["band"])
             if qnw.get("channel") is not None:
                 parts.append(f"ch {qnw['channel']}")
-        qcsq = ctx.get("qcsq")
-        if qcsq and qcsq.get("sysmode") == "LTE":
-            sig_parts = []
-            if qcsq.get("rsrp") is not None:
-                sig_parts.append(f"RSRP {qcsq['rsrp']}")
-            if qcsq.get("rsrq") is not None:
-                sig_parts.append(f"RSRQ {qcsq['rsrq']}")
-            if qcsq.get("sinr") is not None:
-                sig_parts.append(f"SINR {qcsq['sinr']:.1f}")
-            if sig_parts:
-                parts.append(" / ".join(sig_parts))
         self.lbl_context.config(text="  ·  ".join(parts) if parts else "No context available.")
 
-        # Cells table
+        # Results table — one row per PLMN
         for iid in self.cells_tree.get_children():
             self.cells_tree.delete(iid)
 
@@ -544,30 +607,59 @@ class ModemUI:
                 return f"{v:.0f}"
             return str(v)
 
-        for cell in cells:
-            mcc, mnc = cell.get("mcc"), cell.get("mnc")
-            if mcc is not None and mnc is not None:
-                mccmnc = f"{mcc}/{mnc:02d}"
+        rich_count = 0
+        for r in results:
+            op = r["op"]
+            serving = r.get("serving") or {}
+            qcsq = r.get("qcsq") or {}
+            csq = r.get("csq") or {}
+
+            if r["status"] in ("ok", "neighbor"):
+                rich_count += 1
+                rsrp = serving.get("rsrp") if serving.get("rsrp") is not None else qcsq.get("rsrp")
+                rsrq = serving.get("rsrq") if serving.get("rsrq") is not None else qcsq.get("rsrq")
+                rssi = serving.get("rssi") if serving.get("rssi") is not None else qcsq.get("rssi")
+                sinr = serving.get("sinr") if serving.get("sinr") is not None else qcsq.get("sinr")
+                # GSM fallback: surface CSQ-derived dBm in the RSRP column
+                if rsrp is None and csq.get("dbm") is not None:
+                    rsrp = csq["dbm"]
+                name = op["name"] + (" (nbr)" if r["status"] == "neighbor" else "")
+                values = (
+                    name,
+                    op["mccmnc"],
+                    op["act_label"],
+                    fmt(serving.get("pci")),
+                    fmt(serving.get("earfcn")),
+                    serving.get("cell_id") or "—",
+                    serving.get("tac") or "—",
+                    fmt(rsrp),
+                    fmt(rsrq),
+                    fmt(rssi),
+                    fmt(sinr),
+                )
+                if r["status"] == "ok" and op.get("stat") == 2:
+                    tag = "serving"
+                else:
+                    tag = ""
             else:
-                mccmnc = "—"
-            kind_label = "Serving" if cell["kind"] == "servingcell" else "Neighbor"
-            tag = "serving" if cell["kind"] == "servingcell" else ""
-            self.cells_tree.insert(
-                "", "end",
-                values=(
-                    kind_label,
-                    mccmnc,
-                    fmt(cell.get("pci")),
-                    fmt(cell.get("earfcn")),
-                    cell.get("cell_id") or "—",
-                    cell.get("tac") or "—",
-                    fmt(cell.get("rsrp")),
-                    fmt(cell.get("rsrq")),
-                    fmt(cell.get("sinr")),
-                ),
-                tags=(tag,) if tag else (),
+                values = (
+                    op["name"],
+                    op["mccmnc"],
+                    op["act_label"],
+                    "—", "—", "—", "—", "—", "—", "—", "—",
+                )
+                # nosim: discovery-only (no SIM) — not a failure, just skipped.
+                tag = "" if r["status"] == "nosim" else "failed"
+
+            self.cells_tree.insert("", "end", values=values, tags=(tag,) if tag else ())
+
+        plmn_count = len({(r["op"]["numeric"], r["op"]["act"]) for r in results})
+        if any(r["status"] == "nosim" for r in results):
+            self.lbl_scan_status.config(
+                text=f"{rich_count} cell(s) · {plmn_count} PLMN(s) (no SIM)"
             )
-        self.lbl_scan_status.config(text=f"{len(cells)} cell(s)")
+        else:
+            self.lbl_scan_status.config(text=f"{rich_count}/{plmn_count} PLMN(s) captured")
 
     def send_command(self, cmd, timeout=1, delay=0.5):
         if not self.com_port:
@@ -604,13 +696,148 @@ class ModemUI:
             self.btn_poll.config(text="Stop Signal Polling")
             threading.Thread(target=self.poll_loop, daemon=True).start()
 
-    def site_scan_loop(self):
-        self.btn_site_scan.config(state=tk.DISABLED)
-        self.btn_plmn_scan.config(state=tk.DISABLED)
+    def _wait_for_registration(self, timeout_s=20, poll_s=2):
+        # Poll AT+CEREG? until registered (stat in 1/5), denied (3), or
+        # timed out. Returns the final stat (int) or None for timeout.
+        deadline = time.monotonic() + timeout_s
+        last = None
+        while time.monotonic() < deadline:
+            c = parse_cereg(self.send_command("AT+CEREG?"))
+            if c:
+                last = c["stat"]
+                if last in (1, 3, 5):
+                    return last
+            time.sleep(poll_s)
+        return last  # may be 0/2/4 on timeout
+
+    def _capture_current_cell(self):
+        # Grab signal + serving-cell detail + QuecCell neighbour list for
+        # whatever cell the modem is camped on right now (registered or
+        # LIMSRV). Without a SIM, LIMSRV is the only way we can get rich
+        # data on this modem, so this function is the core of the no-SIM
+        # path. QCELLINFO needs a warm-up period to populate its cache.
+        csq = parse_csq(self.send_command("AT+CSQ"))
+        qcsq_resp = self.send_command("AT+QCSQ")
+        self.log(f"QCSQ: {qcsq_resp}")
+        qcsq = parse_qcsq(qcsq_resp)
+        serving_resp = self.send_command('AT+QENG="servingcell"', timeout=3, delay=1.0)
+        self.log(f"QENG servingcell: {serving_resp}")
+        serving = parse_qeng_servingcell(serving_resp)
+
+        # QuecCell: enable periodic cell info, wait for the cache to populate,
+        # then query it. This returns serving + intra-freq neighbours.
+        self.send_command("AT+QCELLINFO=1", timeout=3, delay=0.5)
+        time.sleep(3)
+        qcellinfo_resp = self.send_command("AT+QCELLINFO?", timeout=6, delay=2.0)
+        self.log(f"QCELLINFO: {qcellinfo_resp}")
+        cells = parse_qcellinfo(qcellinfo_resp)
+        self.send_command("AT+QCELLINFO=0", timeout=3, delay=0.5)
+        return csq, qcsq, serving, cells
+
+    def _match_plmn(self, serving, ops):
+        # Find the PLMN in ops whose numeric matches the MCC/MNC reported
+        # by QENG. MNC can be 2 or 3 digits and COPS=? may report it either
+        # zero-padded or not, so try all common variants.
+        if not serving or serving.get("mcc") is None or serving.get("mnc") is None:
+            return None
+        mcc, mnc = serving["mcc"], serving["mnc"]
+        candidates = {f"{mcc}{mnc:02d}", f"{mcc}{mnc:03d}", f"{mcc}{mnc}"}
+        for op in ops:
+            if op.get("numeric") in candidates:
+                return (op["numeric"], op["act"])
+        return None
+
+    def _build_nosim_results(self, ops, csq, qcsq, qeng_serving, qcellinfo_cells):
+        # Render one row per QCELLINFO cell whose MCC/MNC matches a PLMN
+        # from discovery. Fall back to QENG's serving cell if QCELLINFO was
+        # empty. Remaining PLMNs in the discovery list get a single dash
+        # row apiece.
+        results = []
+        matched_keys = set()
+
+        def _serving_dict_from_cell(cell):
+            # QCELLINFO has no RSRQ; borrow it from QENG if PCI/EARFCN line
+            # up with the serving cell we already have.
+            rsrq = None
+            if (qeng_serving and cell.get("pci") == qeng_serving.get("pci")
+                    and cell.get("earfcn") == qeng_serving.get("earfcn")):
+                rsrq = qeng_serving.get("rsrq")
+            return {
+                "rat": "LTE",
+                "mcc": cell.get("mcc"),
+                "mnc": cell.get("mnc"),
+                "cell_id": cell.get("cell_id"),
+                "pci": cell.get("pci"),
+                "earfcn": cell.get("earfcn"),
+                "tac": cell.get("tac"),
+                "rsrp": cell.get("rsrp"),
+                "rssi": cell.get("rssi"),
+                "sinr": cell.get("sinr"),
+                "rsrq": rsrq,
+            }
+
+        for cell in qcellinfo_cells or []:
+            match = self._match_plmn(cell, ops)
+            if not match:
+                continue
+            op = next(o for o in ops if (o["numeric"], o["act"]) == match)
+            matched_keys.add(match)
+            status = "ok" if cell["kind"] == "servingcell" else "neighbor"
+            results.append({
+                "op": op, "status": status,
+                "csq": csq if status == "ok" else None,
+                "qcsq": qcsq if status == "ok" else None,
+                "serving": _serving_dict_from_cell(cell),
+            })
+
+        # QCELLINFO empty or yielded no matches? Fall back to the QENG
+        # serving cell — one row for whichever PLMN it matches.
+        if not results:
+            match = self._match_plmn(qeng_serving, ops)
+            if match:
+                matched_keys.add(match)
+                op = next(o for o in ops if (o["numeric"], o["act"]) == match)
+                results.append({
+                    "op": op, "status": "ok",
+                    "csq": csq, "qcsq": qcsq, "serving": qeng_serving,
+                })
+
+        if matched_keys:
+            joined = ", ".join(k[0] for k in matched_keys)
+            self.log(f"Enriched {len(results)} row(s) from LIMSRV capture: {joined}")
+        else:
+            self.log("No LIMSRV cell matched any discovered PLMN — discovery-only.")
+
+        for op in ops:
+            if (op["numeric"], op["act"]) not in matched_keys:
+                results.append({"op": op, "status": "nosim"})
+        return results
+
+    def full_scan_loop(self):
+        self.btn_full_scan.config(state=tk.DISABLED)
         self.btn_poll.config(state=tk.DISABLED)
-        self.lbl_scan_status.config(text="Scanning site…")
-        self.log("Site scan started.")
         try:
+            # Pre-loop: SIM state. Missing SIM (CME 10) is OK — we can still
+            # do discovery. Other non-READY states (PIN/PUK/failure) abort.
+            cpin_resp = self.send_command("AT+CPIN?")
+            self.log(f"CPIN: {cpin_resp}")
+            cpin_up = (cpin_resp or "").upper()
+            sim_ready = "READY" in cpin_up
+            sim_missing = parse_cme_error(cpin_resp) == 10
+            if not sim_ready and not sim_missing:
+                self.log("SIM not READY (locked or failure) — aborting scan.")
+                self.lbl_scan_status.config(text="SIM not ready — see console")
+                return
+            if sim_missing:
+                self.log("No SIM detected. Will run discovery only — "
+                         "per-PLMN signal/cell detail requires a SIM.")
+
+            # Probe AT+QNWLOCK support. If the firmware accepts it, future
+            # work can drive per-(EARFCN, PCI) camping without a SIM. Just
+            # log the result for now.
+            qnwlock_probe = self.send_command("AT+QNWLOCK=?", timeout=3, delay=0.5)
+            self.log(f"QNWLOCK probe: {qnwlock_probe or '(no response)'}")
+
             cereg_resp = self.send_command("AT+CEREG?")
             self.log(f"CEREG: {cereg_resp}")
             cereg = parse_cereg(cereg_resp)
@@ -619,105 +846,129 @@ class ModemUI:
             self.log(f"QNWINFO: {qnwinfo_resp}")
             qnwinfo = parse_qnwinfo(qnwinfo_resp)
 
-            qcsq_resp = self.send_command("AT+QCSQ")
-            self.log(f"QCSQ: {qcsq_resp}")
-            qcsq = parse_qcsq(qcsq_resp)
+            # Snapshot whatever cell the modem is camped on right now — this
+            # is the "LIMSRV" cell without a SIM, or the registered cell with
+            # one. Done BEFORE COPS=? because the 2-minute scan puts the
+            # modem into a transient searching state afterwards.
+            initial_csq, initial_qcsq, initial_serving, initial_cells = (
+                self._capture_current_cell()
+            )
 
-            serving_resp = self.send_command('AT+QENG="servingcell"', timeout=3, delay=1.0)
-            self.log(f"QENG servingcell: {serving_resp}")
-            serving = parse_qeng_servingcell(serving_resp)
+            # PLMN discovery
+            self.lbl_scan_status.config(text="PLMN discovery… up to 3 min")
+            self.log("PLMN discovery (AT+COPS=?) started. May take up to 3 minutes.")
+            cops_resp = self.send_command("AT+COPS=?", timeout=180, delay=120)
+            self.log(f"COPS=? raw: {cops_resp}")
+            all_ops = parse_cops(cops_resp)
+            for op in all_ops:
+                self.log(
+                    f"  {op['stat_label']:<10} {op['name']:<18} "
+                    f"{op['mccmnc']:<10} {op['act_label']}"
+                )
+            ops = dedupe_plmns(all_ops)
+            ctx = {"cereg": cereg, "qnwinfo": qnwinfo}
 
-            qcellinfo_resp = self.send_command("AT+QCELLINFO?", timeout=6, delay=2.0)
-            self.log(f"QCELLINFO: {qcellinfo_resp}")
-            cells = parse_qcellinfo(qcellinfo_resp)
+            if not ops:
+                self.lbl_scan_status.config(text="No PLMNs found")
+                self.log("No non-Forbidden PLMNs found; nothing to display.")
+                self.root.after(0, self._apply_full_scan, ctx, [])
+                return
 
-            neigh_resp = self.send_command('AT+QENG="neighbourcell"', timeout=5, delay=2.0)
-            self.log(f"QENG neighbourcell: {neigh_resp}")
-            neighbors = parse_qeng_neighbourcell(neigh_resp)
+            # No-SIM path: no registration possible, but the LIMSRV-camped
+            # cell (and any intra-freq neighbours QCELLINFO decoded) give us
+            # rich data for a subset of PLMNs.
+            if sim_missing:
+                results = self._build_nosim_results(
+                    ops, initial_csq, initial_qcsq, initial_serving, initial_cells
+                )
+                self.root.after(0, self._apply_full_scan, ctx, results)
+                rich = sum(1 for r in results if r["status"] in ("ok", "neighbor"))
+                self.lbl_scan_status.config(
+                    text=f"{rich} cell(s) · {len(ops)} PLMN(s) (no SIM)"
+                )
+                return
 
-            # Enrich QCELLINFO cells with RSRQ/srxlev from QENG (matched by PCI + EARFCN)
-            neigh_by_key = {
-                (n["pci"], n["earfcn"]): n for n in neighbors if n.get("pci") is not None
-            }
-            for c in cells:
-                key = (c.get("pci"), c.get("earfcn"))
-                n = neigh_by_key.get(key)
-                c["rsrq"] = n["rsrq"] if n else None
-                c["srxlev"] = n["srxlev"] if n else None
-
-            # Serving cell RSRQ/srxlev comes from QENG servingcell, not neighbours
-            if serving and serving.get("rat") == "LTE":
-                for c in cells:
-                    if c["kind"] == "servingcell":
-                        if c.get("rsrq") is None:
-                            c["rsrq"] = serving.get("rsrq")
-                        if c.get("srxlev") is None:
-                            c["srxlev"] = serving.get("srxlev")
-
-            # If QCELLINFO returned nothing but QENG servingcell did, synthesize
-            # a single serving row so the user sees something.
-            if not cells and serving and serving.get("rat") == "LTE" and serving.get("pci") is not None:
-                cells = [{
-                    "kind": "servingcell",
-                    "rat": "LTE",
-                    "mcc": serving.get("mcc"),
-                    "mnc": serving.get("mnc"),
-                    "tac": serving.get("tac"),
-                    "cell_id": serving.get("cell_id"),
-                    "pci": serving.get("pci"),
-                    "earfcn": serving.get("earfcn"),
-                    "rsrp": serving.get("rsrp"),
-                    "rsrq": serving.get("rsrq"),
-                    "rssi": serving.get("rssi"),
-                    "sinr": serving.get("sinr"),
-                    "srxlev": serving.get("srxlev"),
-                }]
-
-            ctx = {"cereg": cereg, "qnwinfo": qnwinfo, "qcsq": qcsq, "serving": serving}
-            self.root.after(0, self._apply_site_scan, ctx, cells)
-            self.log(f"Site scan complete: {len(cells)} cell(s).")
-        finally:
-            self.btn_site_scan.config(state=tk.NORMAL)
-            self.btn_plmn_scan.config(state=tk.NORMAL)
-            self.btn_poll.config(state=tk.NORMAL)
-
-    def site_scan(self):
-        if self.is_polling:
-            self.log("Error: Stop signal polling before running a site scan.")
-            return
-        threading.Thread(target=self.site_scan_loop, daemon=True).start()
-
-    def plmn_scan_loop(self):
-        self.btn_site_scan.config(state=tk.DISABLED)
-        self.btn_plmn_scan.config(state=tk.DISABLED)
-        self.btn_poll.config(state=tk.DISABLED)
-        self.lbl_scan_status.config(text="PLMN scan… up to 3 min")
-        self.log("PLMN scan (AT+COPS=?) started. May take up to 3 minutes.")
-        try:
-            response = self.send_command("AT+COPS=?", timeout=180, delay=120)
-            self.log(f"COPS=? raw: {response}")
-            ops = parse_cops(response)
-            if ops:
-                for op in ops:
-                    self.log(
-                        f"  {op['stat_label']:<10} {op['name']:<18} "
-                        f"{op['mccmnc']:<10} {op['act_label']}"
+            # Per-PLMN registration + detail capture (SIM present)
+            results = []
+            try:
+                for i, op in enumerate(ops):
+                    self.lbl_scan_status.config(
+                        text=f"[{i + 1}/{len(ops)}] {op['name']} ({op['act_label']})…"
                     )
-                self.lbl_scan_status.config(text=f"{len(ops)} PLMN(s) visible")
-            elif '+COPS:' not in (response or ''):
-                self.lbl_scan_status.config(text="PLMN scan failed — see console")
-            else:
-                self.lbl_scan_status.config(text="No PLMNs visible")
+                    # Deregister first. A prior failed COPS=1 leaves the modem
+                    # in a state where subsequent manual attempts fast-fail
+                    # with CME ERROR 10 until explicitly deregistered.
+                    self.send_command("AT+COPS=2", timeout=10, delay=1.0)
+
+                    self.log(
+                        f"Registering to {op['name']} {op['mccmnc']} ({op['act_label']})…"
+                    )
+                    reg_cmd = f'AT+COPS=1,2,"{op["numeric"]}",{op["act"]}'
+                    reg_resp = self.send_command(reg_cmd, timeout=35, delay=2.0)
+                    if reg_resp:
+                        self.log(f"  COPS reg: {reg_resp}")
+
+                    # Some Quectel firmware rejects the AcT argument — retry
+                    # once without it before giving up.
+                    if "ERROR" in reg_resp.upper() and parse_cme_error(reg_resp) == 10:
+                        self.send_command("AT+COPS=2", timeout=10, delay=1.0)
+                        self.log("  Retrying without AcT parameter…")
+                        reg_cmd = f'AT+COPS=1,2,"{op["numeric"]}"'
+                        reg_resp = self.send_command(reg_cmd, timeout=35, delay=2.0)
+                        if reg_resp:
+                            self.log(f"  COPS reg retry: {reg_resp}")
+
+                    if "ERROR" in reg_resp.upper():
+                        code = parse_cme_error(reg_resp)
+                        results.append({"op": op, "status": "failed", "err": code})
+                        continue
+
+                    # AT+COPS=1 is supposed to block until registration resolves,
+                    # but some firmwares return OK early. Poll CEREG to confirm.
+                    stat = self._wait_for_registration(timeout_s=20)
+                    self.log(f"  CEREG after reg: stat={stat}")
+                    if stat not in (1, 5):
+                        results.append({"op": op, "status": "failed",
+                                        "err": f"cereg_stat={stat}"})
+                        continue
+
+                    csq = parse_csq(self.send_command("AT+CSQ"))
+                    qcsq = None
+                    serving = None
+                    if op["act"] == 7:  # LTE
+                        qcsq_resp = self.send_command("AT+QCSQ")
+                        self.log(f"  QCSQ: {qcsq_resp}")
+                        qcsq = parse_qcsq(qcsq_resp)
+
+                        serving_resp = self.send_command(
+                            'AT+QENG="servingcell"', timeout=3, delay=1.0
+                        )
+                        self.log(f"  QENG servingcell: {serving_resp}")
+                        serving = parse_qeng_servingcell(serving_resp)
+
+                    results.append({
+                        "op": op, "status": "ok",
+                        "csq": csq, "qcsq": qcsq, "serving": serving,
+                    })
+            finally:
+                # Always restore automatic PLMN selection, even if the loop
+                # raised. Leaving the modem in manual mode would strand it on
+                # the last-attempted PLMN.
+                self.send_command("AT+COPS=0", timeout=35, delay=2.0)
+                self.log("Restored automatic PLMN selection (AT+COPS=0).")
+
+            self.root.after(0, self._apply_full_scan, ctx, results)
+            ok = sum(1 for r in results if r["status"] == "ok")
+            self.log(f"Full scan complete: {ok}/{len(results)} PLMN(s) captured.")
         finally:
-            self.btn_site_scan.config(state=tk.NORMAL)
-            self.btn_plmn_scan.config(state=tk.NORMAL)
+            self.btn_full_scan.config(state=tk.NORMAL)
             self.btn_poll.config(state=tk.NORMAL)
 
-    def plmn_scan(self):
+    def full_scan(self):
         if self.is_polling:
-            self.log("Error: Stop signal polling before running a PLMN scan.")
+            self.log("Error: Stop signal polling before running a network scan.")
             return
-        threading.Thread(target=self.plmn_scan_loop, daemon=True).start()
+        threading.Thread(target=self.full_scan_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
