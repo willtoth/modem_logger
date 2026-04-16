@@ -86,6 +86,20 @@ CEREG_STAT = {
     5: "roaming",
 }
 
+# Representative LTE downlink EARFCNs for the QNWLOCK no-SIM band sweep.
+# Limited to the LTE bands the EG915U-EU actually supports (B1, B3, B7,
+# B8, B20, B28). One probe per band at roughly band-center; the modem
+# camps on whatever cell it can hear on that channel. Each candidate
+# adds ~12 s to the scan.
+LTE_SWEEP_EARFCNS = [
+    (6300, "B20/800"),    # EU/Africa coverage band
+    (9435, "B28/700"),    # APT 700 — Africa/SEA
+    (1575, "B3/1800"),    # Near-universal urban LTE
+    (300,  "B1/2100"),    # Europe/APAC capacity
+    (3625, "B8/900"),     # Refarmed GSM band
+    (3100, "B7/2600"),    # Urban capacity
+]
+
 
 def find_modem_ports():
     ports = []
@@ -842,6 +856,98 @@ class ModemUI:
                 results.append({"op": op, "status": "nosim"})
         return results
 
+    def _qnwlock_sweep(self, ops, known_results):
+        # Force-camp the modem on each candidate LTE EARFCN via AT+QNWLOCK
+        # and capture whatever LIMSRV cell it lands on. Without a SIM this
+        # is the only way to get rich data on cells outside the band the
+        # modem happened to start on. Dedupes against cells already in
+        # known_results; returns only new rows.
+        def _key(c):
+            return (c.get("mcc"), c.get("mnc"), c.get("pci"),
+                    c.get("earfcn"), c.get("cell_id"))
+
+        seen = {
+            _key(r["serving"]) for r in known_results
+            if r.get("serving") and r["status"] in ("ok", "neighbor")
+        }
+        new_results = []
+        try:
+            for i, (earfcn, band_label) in enumerate(LTE_SWEEP_EARFCNS):
+                self.lbl_scan_status.config(
+                    text=f"Band sweep [{i + 1}/{len(LTE_SWEEP_EARFCNS)}] "
+                         f"{band_label} EARFCN {earfcn}…"
+                )
+                self.log(f"Sweep {band_label}: locking to EARFCN {earfcn}…")
+                lock_resp = self.send_command(
+                    f'AT+QNWLOCK="lte",1,{earfcn}', timeout=8, delay=1.5
+                )
+                if "ERROR" in (lock_resp or "").upper():
+                    self.log(f"  QNWLOCK rejected: {lock_resp.strip()}")
+                    continue
+                # Wait for the modem to scan the channel and (maybe) camp.
+                time.sleep(6)
+                csq, qcsq, serving, cells = self._capture_current_cell()
+
+                added_here = 0
+                # Prefer QCELLINFO — it carries MCC/MNC and may include
+                # neighbour cells on the same locked frequency.
+                for cell in cells or []:
+                    match = self._match_plmn(cell, ops)
+                    if not match:
+                        continue
+                    k = _key(cell)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    op = next(o for o in ops
+                              if (o["numeric"], o["act"]) == match)
+                    status = "ok" if cell["kind"] == "servingcell" else "neighbor"
+                    rsrq = (serving.get("rsrq") if serving
+                            and cell.get("pci") == serving.get("pci")
+                            and cell.get("earfcn") == serving.get("earfcn")
+                            else None)
+                    new_results.append({
+                        "op": op, "status": status,
+                        "csq": csq if status == "ok" else None,
+                        "qcsq": qcsq if status == "ok" else None,
+                        "serving": {
+                            "rat": "LTE",
+                            "mcc": cell.get("mcc"),
+                            "mnc": cell.get("mnc"),
+                            "cell_id": cell.get("cell_id"),
+                            "pci": cell.get("pci"),
+                            "earfcn": cell.get("earfcn"),
+                            "tac": cell.get("tac"),
+                            "rsrp": cell.get("rsrp"),
+                            "rssi": cell.get("rssi"),
+                            "sinr": cell.get("sinr"),
+                            "rsrq": rsrq,
+                        },
+                    })
+                    added_here += 1
+
+                # Fallback: QCELLINFO empty but modem did camp — take QENG.
+                if added_here == 0 and serving:
+                    match = self._match_plmn(serving, ops)
+                    if match and _key(serving) not in seen:
+                        seen.add(_key(serving))
+                        op = next(o for o in ops
+                                  if (o["numeric"], o["act"]) == match)
+                        new_results.append({
+                            "op": op, "status": "ok",
+                            "csq": csq, "qcsq": qcsq, "serving": serving,
+                        })
+                        added_here += 1
+
+                if added_here:
+                    self.log(f"  Sweep {band_label}: +{added_here} cell(s)")
+                else:
+                    self.log(f"  Sweep {band_label}: no new cells")
+        finally:
+            self.send_command('AT+QNWLOCK="lte",0', timeout=5, delay=1.0)
+            self.log("Released QNWLOCK (automatic band selection restored).")
+        return new_results
+
     def full_scan_loop(self):
         self.btn_full_scan.config(state=tk.DISABLED)
         self.btn_poll.config(state=tk.DISABLED)
@@ -905,11 +1011,39 @@ class ModemUI:
 
             # No-SIM path: no registration possible, but the LIMSRV-camped
             # cell (and any intra-freq neighbours QCELLINFO decoded) give us
-            # rich data for a subset of PLMNs.
+            # rich data for a subset of PLMNs. If QNWLOCK is supported, we
+            # additionally sweep through representative EARFCNs across bands
+            # to force re-camping on other cells.
             if sim_missing:
                 results = self._build_nosim_results(
                     ops, initial_csq, initial_qcsq, initial_serving, initial_cells
                 )
+                if "ERROR" not in (qnwlock_probe or "").upper():
+                    self.log(
+                        f"Starting QNWLOCK band sweep across "
+                        f"{len(LTE_SWEEP_EARFCNS)} candidate EARFCN(s) "
+                        f"(~{len(LTE_SWEEP_EARFCNS) * 12}s)…"
+                    )
+                    sweep_results = self._qnwlock_sweep(ops, results)
+                    if sweep_results:
+                        newly_matched = {
+                            (r["op"]["numeric"], r["op"]["act"])
+                            for r in sweep_results
+                        }
+                        # Drop discovery-only rows we now have real data for.
+                        results = [
+                            r for r in results
+                            if not (r["status"] == "nosim"
+                                    and (r["op"]["numeric"], r["op"]["act"])
+                                    in newly_matched)
+                        ] + sweep_results
+                        self.log(
+                            f"Sweep added {len(sweep_results)} cell(s)."
+                        )
+                    else:
+                        self.log("Sweep yielded no additional cells.")
+                else:
+                    self.log("Skipping band sweep — QNWLOCK unsupported.")
                 self.root.after(0, self._apply_full_scan, ctx, results)
                 rich = sum(1 for r in results if r["status"] in ("ok", "neighbor"))
                 self.lbl_scan_status.config(
